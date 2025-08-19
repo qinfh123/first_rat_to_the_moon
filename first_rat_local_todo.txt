@@ -1,0 +1,445 @@
+《萌鼠摘月 / 萌鼠登月（First Rat）》——本地可玩版本 架构与TODO说明文档 (TXT)
+==============================================================================
+目标与范围
+------------------------------------------------------------------------------
+- 目标：实现一个“本地可玩”的《萌鼠摘月 / 萌鼠登月（First Rat）》规则引擎与命令行客户端（CLI）。
+- 范围：仅离线单机/同屏多人（轮流操作同一终端），不包含网络联机。
+- 设计原则：
+  1) 面向对象（OOP）与模块化；2) 可测试、可回放；3) 状态可序列化；4) 易扩展。
+- 风险与声明：具体分值/细则随版本或发行版不同可能略有差异，本文档采用“可配置参数”的方式，
+  将分值、位置、代价等抽象到 Config 中，避免规则硬编码。
+
+
+==============================================================================
+一、项目结构建议（仅本地版）
+------------------------------------------------------------------------------
+first_rat_local/
+  core/                     # 纯规则引擎（与UI分离）
+    __init__.py
+    enums.py                # 枚举与常量
+    config.py               # 可配置常量（分值、起始参数、棋盘布局等）
+    models.py               # 数据模型（Board, Space, Player, Rat, Inventory, Rocket...）
+    actions.py              # 动作对象定义（Move/Buy/Steal/Build/Donate/EndTurn...）
+    rules.py                # 规则校验与效果解析（ActionValidator/EffectResolver）
+    state.py                # GameState（可序列化、随机种子、历史日志）
+    scoring.py              # 计分与终局判定
+    setup.py                # 标准布局与变体构造器
+    events.py               # 领域事件（资源变化、登船、回家、加分、游戏结束等）
+    exceptions.py
+    utils.py                # 辅助：ID 生成、深拷贝、差分、RNG 包装
+  cli/                      # 终端界面
+    __init__.py
+    app.py                  # 主循环（渲染状态、读取输入、调用规则引擎）
+    render.py               # 文本渲染工具（棋盘、背包、分数、可行动作）
+    input_schemas.py        # 输入解析与校验（防止非法输入）
+  tests/
+    test_move.py
+    test_shops.py
+    test_build_and_donate.py
+    test_launch_and_endgame.py
+    test_serialization.py
+    test_replay.py
+  tools/
+    replay.py               # 使用历史日志回放一局游戏
+    export_state.py         # 导出当前状态为 JSON
+
+说明：所有业务规则在 core/ 中实现，cli/ 仅负责展示与输入，便于未来替换为 GUI。
+
+
+==============================================================================
+二、核心领域建模（core/）
+------------------------------------------------------------------------------
+A. 枚举与常量（enums.py）
+----------------------------------------
+1) 颜色 Color：GREEN, YELLOW, RED, BLUE
+2) 资源 Resource：CHEESE（奶酪）, TIN_CAN（罐头）, SODA（苏打粉）, LIGHTBULB（灯泡）, BOTTLECAP（瓶盖）
+3) 空格类型 SpaceKind：
+   - RESOURCE            # 产出指定资源
+   - SHOP_MOLE           # 鼹鼠店（扩容背包）
+   - SHOP_FROG           # 青蛙店（获得一次性 X2 饮料）
+   - SHOP_CROW           # 乌鸦店（获得/交换瓶盖加分）
+   - LIGHTBULB_TRACK     # 推进灯泡轨道
+   - SHORTCUT            # 捷径（可能需要支付或有风险的通过）
+   - HAZARD              # 危险/惩罚（可选：如被打回等，按配置）
+   - START               # 起点
+   - LAUNCH_PAD          # 发射台（抵达可登船）
+4) 动作类型 ActionType：MOVE, BUY, STEAL, BUILD_ROCKET, DONATE_CHEESE, END_TURN
+5) 火箭部件 RocketPart：NOSE, TANK, ENGINE, FIN_A, FIN_B  （可在配置扩展）
+6) 事件类型 DomainEventType：RESOURCE_GAINED, RESOURCE_SPENT, INVENTORY_CHANGED,
+   TRACK_ADVANCED, SHOP_BOUGHT, SHOP_STOLEN, SENT_HOME, ON_ROCKET, NEW_RAT_GAINED,
+   SCORE_CHANGED, PART_BUILT, CHEESE_DONATED, TURN_ENDED, GAME_ENDED, LOG
+
+B. 全局配置（config.py）
+----------------------------------------
+- Config 对象提供所有“易变规则”的集中管理：
+  * BOARD_LAYOUT：棋盘格列表，包含每格：id/index, color, kind, payload（如资源类型、数量、商店价目等）
+  * STARTING_RATS：每玩家初始老鼠数量（默认 2）与上限（默认 4）
+  * STARTING_INVENTORY_CAPACITY：默认 3（鼹鼠店可扩）
+  * SODA_X2_ONCE：True，表示青蛙店饮料会让一次资源获取翻倍（一次性）；触发规则由配置决定（如“本回合内第一次资源获取”）
+  * LIGHTBULB_TRACK_REWARDS：轨道每级奖励或被动增益（例如：每次收集额外+1 或 一次性奖励）
+  * SHOP_PRICES：购买/升级所需资源组合
+  * STEAL_RULES：偷窃的收益与惩罚（通常：获得物品但老鼠被送回 START）
+  * ROCKET_PART_COSTS：建造各部件所需资源组合与即时得分
+  * DONATE_REWARDS：捐赠奶酪的得分表
+  * SCORING_RULES：最终计分构成（各条权重/分值）
+  * ENDGAME_TRIGGERS：终局触发：a) 某玩家第 4 只老鼠登船；b) 放置第 8 个得分标记（可配置）
+  * MOVE_RULES：单鼠 1–5 步；多鼠（2–4 只）各 1–3 步；落点颜色一致；落点不能与任何老鼠重叠
+  * SHORTCUT_RULES / HAZARD_RULES：捷径或危险格的细节（过路条件、代价、事件）
+  * RANDOM_SEED：默认随机种子，确保回放一致
+
+C. 数据模型（models.py）
+----------------------------------------
+1) Space
+   - 字段：space_id:int, index:int, color:Color, kind:SpaceKind, payload:dict
+   - 说明：棋盘是线性路径（含捷径可选）；index 越大越靠近发射台。
+2) Board
+   - 字段：spaces:list[Space], start_index:int, launch_index:int, shortcuts:dict[int,int]|None
+   - 方法：get_space(idx), is_within_bounds(idx), next_index(idx, steps), is_occupied(idx, all_rats)
+3) Rat
+   - 字段：rat_id:str, owner_id:str, space_index:int, on_rocket:bool=False
+4) Inventory
+   - 字段：capacity:int, res:dict[Resource,int], x2_active:bool=False, bottlecaps:int=0
+   - 方法：can_add(amount)->bool, add(resource, n), remove(resource, n), has(resource, n)
+5) Player
+   - 字段：player_id:str, name:str, rats:list[Rat], inv:Inventory, tracks:dict[str,int], score:int=0
+   - 字段：built_parts:set[RocketPart]（用于计分/里程碑）
+6) Rocket
+   - 字段：parts:dict[RocketPart, str|None]  # 记录贡献者的 player_id
+7) GameState
+   - 字段：players:list[Player], board:Board, rocket:Rocket
+           current_player:int, round:int, phase:str
+           rng_seed:int, history:list[dict]（动作与事件日志）
+           game_over:bool=False, winner_ids:list[str]|None
+   - 方法：clone(), to_dict(), from_dict(), current_player_obj(), next_player()
+
+D. 动作对象（actions.py）
+----------------------------------------
+- 所有动作 Action：包含 type:ActionType 与 payload:dict
+1) MoveAction payload：
+   - moves: list[(rat_id:str, steps:int)]     # 1 只鼠(1-5步) 或 2-4 只(各 1-3 步)
+2) BuyAction payload：
+   - shop_kind: SpaceKind, item:str / level:int（升级目标），payer_rat_id（在哪只老鼠所在格购买）
+3) StealAction payload：
+   - shop_kind: SpaceKind, target_item:str，同上 payer_rat_id
+4) BuildRocketAction payload：
+   - part: RocketPart
+5) DonateCheeseAction payload：
+   - amount:int  或  tier:str（根据配置映射得分）
+6) EndTurnAction payload：{}
+
+E. 规则与效果（rules.py）
+----------------------------------------
+组件划分：
+1) ActionValidator：只做“合法性判定”，不修改状态
+   - validate_move(state, action) → (ok:bool, err:str|None, derived:dict)  # derived 可输出落点与收获预览
+   - validate_buy(state, action)  → (ok, err)
+   - validate_steal(state, action)→ (ok, err)
+   - validate_build(state, action)→ (ok, err)
+   - validate_donate(state, action)→(ok, err)
+2) EffectResolver：在验证通过后，按“事件顺序”修改状态并产出领域事件 list[DomainEvent]
+   - resolve_move：
+     * 计算每个移动后落点 → 检查落点颜色是否一致、不可重叠、不可与任何鼠重叠
+     * 结算每个落点：
+       - RESOURCE：获得资源（考虑 x2_active 的一次性翻倍规则）
+       - LIGHTBULB_TRACK：推进轨道与奖励
+       - SHOP_*：标记此回合可进行买/偷（或直接允许 BUY/STEAL 动作）
+       - SHORTCUT/HAZARD：按配置触发（扣资源、回退、送回起点等）
+       - LAUNCH_PAD：可登船（见下）
+   - resolve_buy：扣除资源 → 增加背包容量（鼹鼠店）/ 启用 x2（青蛙）/ 增加瓶盖（乌鸦）
+   - resolve_steal：获得物品，同时把该老鼠送回 START（SENT_HOME）
+   - resolve_build：扣资源、占领火箭部件（PART_BUILT，记录贡献者，加分）
+   - resolve_donate：扣奶酪，按 DONATE_REWARDS 增加分数（SCORE_CHANGED）
+   - 登船逻辑（move 后或特定时机）：
+     * 若老鼠所在为 LAUNCH_PAD，可将该鼠标记为 on_rocket=True（ON_ROCKET）
+     * 若玩家老鼠数量未达上限，获得一只新老鼠生成在 START（NEW_RAT_GAINED）
+   - 终局检测（每次动作结尾）：
+     * 若 ENDGAME_TRIGGERS 满足 → game_over=True，计算最终得分与 winner_ids
+3) 不变式检查（内部）：
+   - 资源不为负、背包不超容、老鼠位置唯一、分数非负等
+
+F. 计分与终局（scoring.py）
+----------------------------------------
+1) 终局触发：
+   - 触发条件之一（配置化）：a) 某玩家第 4 只老鼠登船；b) 第 8 个得分标记放置完毕
+2) 最终计分项（均从 Config.SCoring_RULES 读取权重/表）：
+   - 火箭部件贡献（不同部件不同分）
+   - 瓶盖（套装或数量分）
+   - 捐奶酪累计分
+   - 灯泡轨道分（轨道等级或奖励累计）
+   - 余料（剩余资源按比例折算分，或不计，配置化）
+3) 平局判定：火箭上老鼠数多者胜（若仍平，可并列）
+4) scoring.finalize(state) → 返回详细清单与排名
+
+G. 领域事件（events.py）
+----------------------------------------
+- 定义 DomainEvent：type:DomainEventType, payload:dict, actor:player_id, ts:int
+- 用于：
+  * CLI 渲染简报
+  * 工具回放（tools/replay.py）
+  * 调试与审计
+
+H. 游戏状态（state.py）
+----------------------------------------
+- GameState 方法：
+  * apply(action, actor_id) → list[DomainEvent]   # 内部先 Validator，后 Resolver
+  * legal_actions(player_id) → list[Action]       # 可选：生成提示（用于 CLI 高亮）
+  * to_dict() / from_dict()
+  * snapshot() / restore(snapshot)
+- 历史日志（history）：追加 {"action":..., "events":[...]}，可回放
+- RNG：统一用 random.Random(seed) 包装，所有概率统一从 state.rng 获取
+
+I. 初始布局（setup.py）
+----------------------------------------
+- build_standard_board(config) → Board
+  * 根据 Config.BOARD_LAYOUT 构造线性路径（含 START 与 LAUNCH_PAD）
+  * 可加入 SHORTCUT/HAZARD（由 Config 控）
+- new_game(num_players:int, names:list[str], config:Config, seed:int) → GameState
+  * 生成玩家、老鼠、背包、火箭
+  * 设置回合顺序、当前玩家、随机种子
+- 变体支持：通过不同 Config 生成不同风格的棋盘/价格/计分
+
+
+==============================================================================
+三、命令行界面（cli/）
+------------------------------------------------------------------------------
+A. 渲染（render.py）
+----------------------------------------
+- render_board(state)：单行或多行文本展示棋盘索引、颜色首字母、特殊格标记（R/S/F/C/L 等）
+- render_players(state)：显示每名玩家：分数、背包容量、资源、瓶盖、灯泡等级、老鼠位置与是否上船
+- render_actions(state, player_id)：列出可行动作提示（若 core 提供 legal_actions 列表则直接展示）
+- render_events(events)：以时间顺序输出刚刚发生的事件
+
+B. 主循环（app.py）
+----------------------------------------
+- 程序入口：选择人数与玩家名 → 调用 setup.new_game
+- while not state.game_over:
+    1) 清屏与渲染当前状态（board + players）
+    2) 提示并读取指令：MOVE/BUY/STEAL/BUILD/DONATE/END
+    3) 将输入解析为 Action → state.apply(action, current_player_id)
+    4) 渲染事件与错误信息
+    5) 如果回合结束，切换下一玩家
+- 结束后：打印记分表与排名
+
+C. 输入解析（input_schemas.py）
+----------------------------------------
+- parse_move("m rat1:3,rat2:2") → MoveAction
+- parse_buy("b frog") → BuyAction
+- parse_build("build engine") → BuildRocketAction
+- parse_donate("don 3") → DonateCheeseAction
+- parse_end("end") → EndTurnAction
+- 非法输入给出友好错误
+
+D. 可用性增强（可选）
+----------------------------------------
+- 历史命令回放
+- 自动补全/候选（基于 legal_actions）
+
+
+==============================================================================
+四、测试计划（tests/）
+------------------------------------------------------------------------------
+A. 单元测试
+----------------------------------------
+- test_move.py
+  * 单鼠 1–5 步与多鼠 2–4 只各 1–3 步
+  * 落点颜色一致性校验
+  * 落点与已占格冲突校验
+  * 到达 LAUNCH_PAD 登船与补鼠
+- test_shops.py
+  * 鼹鼠店扩容：价格扣除、容量增加、上限校验
+  * 青蛙店饮料：x2_active 一次性生效与清除
+  * 乌鸦店瓶盖：获取与累计计分前置
+  * 偷窃：收益与“送回起点”惩罚
+- test_build_and_donate.py
+  * 火箭部件资源扣除与占领、即刻得分
+  * 捐奶酪不同档位得分
+- test_launch_and_endgame.py
+  * 触发：第 4 只老鼠登船 / 第 8 个得分标记
+  * 平局：比较上船老鼠数
+- test_serialization.py
+  * GameState/Action/Event 的 to_dict/from_dict 一致性
+- test_replay.py
+  * 给定 seed + action 序列，重放得到一致终局
+
+B. 性质测试（Hypothesis，选做）
+----------------------------------------
+- 随机合法动作序列 → 不变式保持（资源非负、容量不溢出、位置唯一等）
+
+
+==============================================================================
+五、实现顺序与优先级（P0→P2）
+------------------------------------------------------------------------------
+P0（核心最小集）
+  [ ] enums.py：所有枚举与类型
+  [ ] config.py：默认 Config（含最小棋盘与价格/分值表）
+  [ ] models.py：Space/Board/Rat/Inventory/Player/Rocket/GameState
+  [ ] actions.py：Action 与 5 类动作 payload
+  [ ] rules.py：ActionValidator + EffectResolver（MOVE/BUY/BUILD/END 的最小规则）
+  [ ] scoring.py：终局触发与基础计分（火箭 + 捐奶酪 + 瓶盖；数值来自 Config）
+  [ ] setup.py：build_standard_board + new_game
+  [ ] cli/render.py + cli/app.py：最小回合循环
+  [ ] tests：Move/Build/Endgame/Serialization 基础用例
+
+P1（规则细化与体验）
+  [ ] rules.py：STEAL、LIGHTBULB_TRACK、SHORTCUT/HAZARD 细化
+  [ ] rules.py：SODA x2 的“一次触发”精确定义与实现（例：本回合首次获得资源翻倍）
+  [ ] scoring.py：灯泡轨道/瓶盖套装的更细粒度分值
+  [ ] cli：legal_actions 提示与输入校验器
+
+P2（增强与工具）
+  [ ] tools/replay.py：基于 history 的完整回放
+  [ ] export_state.py：导出/载入存档
+  [ ] tests：Hypothesis 性质测试
+  [ ] 多语言文案（中/英）
+
+
+==============================================================================
+六、关键数据与方法签名（便于 LLM 逐步生成代码）
+------------------------------------------------------------------------------
+# enums.py
+class Color(Enum): ...
+class Resource(Enum): ...
+class SpaceKind(Enum): ...
+class ActionType(Enum): ...
+class RocketPart(Enum): ...
+class DomainEventType(Enum): ...
+
+# models.py 片段
+@dataclass
+class Space:
+    space_id: int
+    index: int
+    color: Color
+    kind: SpaceKind
+    payload: dict[str, Any] = field(default_factory=dict)
+
+@dataclass
+class Rat:
+    rat_id: str
+    owner_id: str
+    space_index: int
+    on_rocket: bool = False
+
+@dataclass
+class Inventory:
+    capacity: int = 3
+    res: dict[Resource, int] = field(default_factory=lambda: defaultdict(int))
+    x2_active: bool = False
+    bottlecaps: int = 0
+    def can_add(self, amount: int) -> bool: ...
+    def add(self, r: Resource, n: int) -> None: ...
+    def remove(self, r: Resource, n: int) -> None: ...
+    def has(self, r: Resource, n: int) -> bool: ...
+
+@dataclass
+class Player:
+    player_id: str
+    name: str
+    rats: list[Rat]
+    inv: Inventory
+    tracks: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    score: int = 0
+    built_parts: set[RocketPart] = field(default_factory=set)
+
+@dataclass
+class Rocket:
+    parts: dict[RocketPart, str | None] = field(default_factory=lambda: {p: None for p in RocketPart})
+
+@dataclass
+class GameState:
+    board: "Board"
+    players: list[Player]
+    rocket: Rocket
+    current_player: int = 0
+    round: int = 1
+    phase: str = "MAIN"
+    rng_seed: int = 0
+    history: list[dict[str, Any]] = field(default_factory=list)
+    game_over: bool = False
+    winner_ids: list[str] | None = None
+    def current_player_obj(self) -> Player: ...
+    def next_player(self) -> None: ...
+    def to_dict(self) -> dict: ...
+    @classmethod
+    def from_dict(cls, data: dict) -> "GameState": ...
+
+@dataclass
+class Board:
+    spaces: list[Space]
+    start_index: int
+    launch_index: int
+    shortcuts: dict[int, int] | None = None
+    def get_space(self, idx: int) -> Space: ...
+    def is_within_bounds(self, idx: int) -> bool: ...
+    def next_index(self, idx: int, steps: int) -> int: ...
+    def is_occupied(self, idx: int, rats: list[Rat]) -> bool: ...
+
+# actions.py
+@dataclass
+class Action:
+    type: ActionType
+    payload: dict[str, Any]
+
+# rules.py（接口草图）
+class ActionValidator:
+    def validate(self, state: GameState, action: Action, actor_id: str) -> tuple[bool, str | None, dict]: ...
+class EffectResolver:
+    def apply(self, state: GameState, action: Action, actor_id: str) -> list["DomainEvent"]: ...
+
+# scoring.py
+def check_endgame(state: GameState) -> bool: ...
+def finalize(state: GameState) -> dict: ...  # 返回详细计分表与排序
+
+# setup.py
+def build_standard_board(config: "Config") -> "Board": ...
+def new_game(num_players: int, names: list[str], config: "Config", seed: int = 0) -> "GameState": ...
+
+
+==============================================================================
+七、LLM 逐步生成建议（提示模板）
+------------------------------------------------------------------------------
+- 生成 enums.py：
+  “请根据 TODO 文档在 core/enums.py 定义 Color/Resource/SpaceKind/ActionType/RocketPart/DomainEventType 枚举。
+   要求：Python 3.10+，使用 Enum；枚举名 ALL_CAPS；附带简短中文注释。”
+
+- 生成 config.py：
+  “请实现 core/config.py 中的 Config 类，包括默认棋盘布局（最小可玩 40~60 格）、商店价格、
+   资源产出、火箭部件成本与分值、捐奶酪档位、终局触发条件、移动规则。提供 @classmethod default() 生成默认配置。”
+
+- 生成 models.py：
+  “请根据签名实现数据类，注意：Inventory.res 用 defaultdict(int)，Board.next_index 需处理边界与捷径。”
+
+- 生成 rules.py（P0）：
+  “请实现 ActionValidator 与 EffectResolver 支持 MOVE/BUY/BUILD/END，严格遵循 Config 的限制。
+   MOVE 必须保障同色落点、不可与任意鼠同格、资源获取考虑 x2_active 的一次性效果。”
+
+- 生成 scoring.py：
+  “请实现终局判断与计分，分值取自 Config；并实现 finalize(state) 返回详细表（每项分数与总分）。”
+
+- 生成 cli/：
+  “请实现渲染与主循环，支持 2~4 名玩家同屏游玩；输入解析容错；每步输出事件摘要。”
+
+
+==============================================================================
+八、示例最小棋盘元素建议（落地用）
+------------------------------------------------------------------------------
+- START（index=0） → 资源/商店与普通格交错分布到 LAUNCH_PAD（末端）
+- 资源格：payload={"resource": Resource.CHEESE, "amount": 1}（其余资源同理）
+- SHOP_MOLE：payload={"price": {TIN_CAN:2}, "capacity_gain": 1}
+- SHOP_FROG：payload={"price": {SODA:2}, "x2_once": True}
+- SHOP_CROW：payload={"price": {CHEESE:2}, "bottlecap_gain": 1}
+- LIGHTBULB_TRACK：payload={"track_gain": 1}
+- HAZARD/SHORTCUT：payload 由 Config 指定（示例：支付 TIN_CAN 1 走捷径）
+- LAUNCH_PAD（终点）：抵达后可登船并触发 NEW_RAT_GAINED（若未达上限）
+
+
+==============================================================================
+九、完成定义（Definition of Done）
+------------------------------------------------------------------------------
+- 通过 P0 测试：规则最小闭环可跑完一局；序列化/回放一致。
+- 通过基础 CLI 交互：可创建 2~4 人局，完成行动与结算，打印最终得分。
+- 代码通过 ruff/black 格式化与 mypy 基础检查（或选做）。
+- 文档：README 简述运行方式与默认规则差异由 Config 管理。
+
+
+（完）

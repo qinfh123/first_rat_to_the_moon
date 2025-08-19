@@ -1,0 +1,18 @@
+# First Rat Local Game Dependencies
+# 萌鼠登月本地游戏依赖
+
+# Core dependencies (游戏核心依赖)
+# No external dependencies required for core game engine
+# 核心游戏引擎无需外部依赖
+
+# Development dependencies (开发依赖)
+pytest>=7.0.0          # Testing framework (测试框架)
+pytest-cov>=4.0.0      # Coverage reporting (覆盖率报告)
+
+# Optional dependencies (可选依赖)
+# mypy>=1.0.0           # Type checking (类型检查)
+# black>=22.0.0         # Code formatting (代码格式化)
+# ruff>=0.1.0           # Linting (代码检查)
+
+# Note: This game is designed to run with Python 3.10+ standard library only
+# 注意：此游戏设计为仅使用Python 3.10+标准库运行
