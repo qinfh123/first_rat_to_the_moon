@@ -204,7 +204,7 @@ def create_demo_game(config: Config | None = None) -> GameState:
     alice.rats[0].space_index = 5  # Move first rat forward
     
     # Give Bob different resources and activate x2
-    bob.inv.add(Resource.SODA, 3)
+    bob.inv.add(Resource.SODA, 2)  # 减少到2个汽水，避免超出容量
     bob.inv.add(Resource.LIGHTBULB, 1)
     bob.inv.x2_active = True
     bob.rats[1].space_index = 8  # Move second rat forward

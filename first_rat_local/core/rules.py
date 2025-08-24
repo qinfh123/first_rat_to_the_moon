@@ -123,18 +123,13 @@ class ActionValidator:
             color_names = [color.value for color in landing_colors]
             return False, f"All rats must land on same color spaces, got: {color_names}", {}
         
-        # Check for occupation conflicts
-        for rat_id, new_index in landing_positions:
-            # Check if space is occupied by any other rat (excluding the moving rats)
-            occupying_rats = [r for r in all_rats if r.space_index == new_index and r.rat_id != rat_id]
-            if occupying_rats:
-                occupier = occupying_rats[0]
-                return False, f"Space {new_index} is occupied by rat {occupier.rat_id}", {}
+        # 修改：允许不同玩家的老鼠共享空间
+        # 只检查同一回合移动的老鼠之间的冲突
         
-        # Check for conflicts between moving rats
+        # Check for conflicts between moving rats (same player's rats cannot land on same space)
         landing_indices = [pos[1] for pos in landing_positions]
         if len(set(landing_indices)) != len(landing_indices):
-            return False, "Multiple rats cannot land on the same space", {}
+            return False, "Multiple rats from the same player cannot land on the same space", {}
         
         # Return derived data for effect resolution
         derived_data = {

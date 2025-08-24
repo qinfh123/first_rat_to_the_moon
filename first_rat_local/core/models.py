@@ -115,6 +115,10 @@ class Player:
     def get_rats_on_board(self) -> List[Rat]:
         """Get all rats that are still on the board (not on rocket)."""
         return [rat for rat in self.rats if not rat.on_rocket]
+    
+    def get_rats_in_inventory(self) -> List[Rat]:
+        """Get all rats that are in the player's inventory (on rocket)."""
+        return [rat for rat in self.rats if rat.on_rocket]
 
 
 @dataclass
